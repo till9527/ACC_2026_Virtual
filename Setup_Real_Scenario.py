@@ -4,7 +4,7 @@ import time
 import numpy as np
 import threading
 # environment objects
-
+import cv2
 from qvl.qlabs import QuanserInteractiveLabs
 from qvl.qcar2 import QLabsQCar2
 from qvl.free_camera import QLabsFreeCamera
@@ -18,8 +18,8 @@ from qvl.yield_sign import QLabsYieldSign
 from qvl.roundabout_sign import QLabsRoundaboutSign
 from qvl.crosswalk import QLabsCrosswalk
 from qvl.traffic_light import QLabsTrafficLight
-
-from pal.products.qcar import QCar, QCarGPS
+from hal.utilities.image_processing import ImageProcessing
+from pal.products.qcar import QCar, QCarGPS,QCarCameras
 from pal.utilities.math import wrap_to_pi
 from hal.content.qcar_functions import QCarEKF
 from hal.products.mats import SDCSRoadMap
@@ -106,59 +106,80 @@ def wait_keep_alive(qcar, gps, ekf, duration):
         qcar.write(0, 0)
         time.sleep(dt)
 
-from hal.products.mats import SDCSRoadMap #
+ #
 
-def drive_to_target_hybrid(qcar, gps, ekf, node_sequence, final_coord, speed_ctrl, car_actor):
+def drive_hybrid_with_vision(qcar, gps, ekf, camera, node_sequence, final_coord, speed_ctrl, car_actor):
     """
-    Drives through a sequence of roadmap nodes for lane centering, 
-    then finishes at a specific coordinate.
+    Blends Roadmap navigation with Real-time Lane Following.
     """
     car_actor.set_led_strip_uniform(GREEN)
     dt = 1.0 / CONTROLLER_RATE
-    roadmap = SDCSRoadMap(leftHandTraffic=False) #
+    roadmap = SDCSRoadMap(leftHandTraffic=False)
     
-    # 1. Generate the 'Lane Centered' part of the path from nodes
+    # 1. Setup Path (Roadmap + Coordinate)
     if node_sequence:
-        path_waypoints = roadmap.generate_path(node_sequence) #
+        path_waypoints = roadmap.generate_path(node_sequence)
     else:
-        # If no nodes provided, start from current position
         qcar.read()
         path_waypoints = np.array([[ekf.x_hat[0,0]], [ekf.x_hat[1,0]]])
 
-    # 2. Append the 'Specific Coordinate' to the end of the roadmap waypoints
-    # This creates a smooth transition from the lane center to your specific spot
     final_segment = np.linspace(path_waypoints[:, -1], final_coord, num=10).T 
-    full_waypoints = np.hstack((path_waypoints, final_segment)) #
+    full_waypoints = np.hstack((path_waypoints, final_segment))
     
-    # 3. Initialize one controller for the entire combined path
-    steer_ctrl = SteeringController(waypoints=full_waypoints, k=0.15) #
+    # 2. Initialize Controllers
+    steer_ctrl = SteeringController(waypoints=full_waypoints, k=0.15)
     
-    print(f"Navigating via nodes {node_sequence} to coordinate {final_coord}")
+    # Blending factor (0.0 = Pure GPS, 1.0 = Pure Vision)
+    # 0.3 means it trusts the Roadmap 70% and the Camera 30%
+    alpha = 0.3 
+
+    print(f"Navigating with Vision-GPS Fusion to {final_coord}")
     
     while True:
-        qcar.read() #
+        # --- SENSOR DATA ---
+        qcar.read()
+        camera.readAll()
         
         if gps.readGPS():
             y_gps = np.array([gps.position[0], gps.position[1], gps.orientation[2]])
             ekf.update([qcar.motorTach, 0], dt, y_gps, qcar.gyroscope[2])
         else:
             ekf.update([qcar.motorTach, 0], dt, None, qcar.gyroscope[2])
-        x, y, th = ekf.x_hat[0, 0], ekf.x_hat[1, 0], ekf.x_hat[2, 0]
-        v = qcar.motorTach
         
-        # Look-ahead point for Stanley
-        p_front = np.array([x, y]) + np.array([np.cos(th), np.sin(th)]) * 0.3 #
+        x, y, th = ekf.x_hat[0, 0], ekf.x_hat[1, 0], ekf.x_hat[2, 0]
+        
+        # --- ROADMAP STEERING (Stanley) ---
+        p_front = np.array([x, y]) + np.array([np.cos(th), np.sin(th)]) * 0.3
+        gps_steering = steer_ctrl.update(p_front, th, qcar.motorTach)
 
-        # Calculate Control
-        thr = speed_ctrl.update(v, V_REF, dt)
-        str_ang = steer_ctrl.update(p_front, th, v)
-        qcar.write(thr, str_ang)
+        # --- VISION STEERING (Lane Following) ---
+        croppedRGB = camera.csiFront.imageData[500:800, :] # Focus on road ahead
+        hsvBuf = cv2.cvtColor(croppedRGB, cv2.COLOR_BGR2HSV)
+        binaryImage = ImageProcessing.binary_thresholding(
+            frame=hsvBuf,
+            lowerBounds=np.array([10, 100, 100]), 
+            upperBounds=np.array([45, 255, 255])
+        )
 
-        # Check if we reached the final specific coordinate
+        slope, intercept = ImageProcessing.find_slope_intercept_from_binary(binary=binaryImage)
+        
+        if not np.isnan(slope):
+            vision_steering = 1.5 * (slope - 0.3419) + (1/150) * (intercept + 5)
+            vision_steering = np.clip(vision_steering, -0.5, 0.5)
+            # BLEND: Use both inputs
+            total_steering = (1 - alpha) * gps_steering + (alpha * vision_steering)
+        else:
+            # If camera loses the lane, fall back 100% to Roadmap
+            total_steering = gps_steering
+
+        # --- EXECUTE ---
+        thr = speed_ctrl.update(qcar.motorTach, V_REF, dt)
+        qcar.write(thr, total_steering)
+
+        # Check for arrival
         dist_to_final = np.linalg.norm(np.array(final_coord) - np.array([x, y]))
         if dist_to_final < 0.2:
-            print("Arrived at specific coordinate.")
-            qcar.write(0, 0) #
+            qcar.write(0, 0)
             break
             
         time.sleep(dt)
@@ -238,8 +259,9 @@ def main():
     qcar = QCar(readMode=1, frequency=CONTROLLER_RATE)
     gps = QCarGPS(initialPose=TAXI_HUB_POS)
     ekf = QCarEKF(x_0=TAXI_HUB_POS)
+    camera = QCarCameras(frameWidth=820, frameHeight=820, frameRate=30, enableFront=True)
 
-    with qcar, gps:
+    with qcar, gps,camera:
         # 2. Magenta (Awaiting mission)
         print("Step 2: Awaiting Mission (Magenta)")
         car_actor.set_led_strip_uniform(MAGENTA)
@@ -249,13 +271,12 @@ def main():
         print("Step 3: Moving to Pickup (Green)")
         #car_actor.set_led_strip_uniform(GREEN)
         # Example: Use nodes 10 and 4 to stay in the lane, then go to the PICKUP_POS
-        drive_to_target_hybrid(
-            qcar, gps, ekf, 
-            node_sequence=[2, 4,14,20], 
-            final_coord=PICKUP_POS, 
-            speed_ctrl=speed_ctrl, 
-            car_actor=car_actor,
-            
+        drive_hybrid_with_vision(
+        qcar, gps, ekf, camera,
+        node_sequence=[2, 4, 14, 20], 
+        final_coord=PICKUP_POS, 
+        speed_ctrl=speed_ctrl, 
+        car_actor=car_actor
         )
 
         # 4. Stop & Blue (Passenger Pick up)
@@ -268,8 +289,8 @@ def main():
         print("Step 5: Moving to Drop-off (Green)")
         # #car_actor.set_led_strip_uniform(GREEN)
         # drive_to_coordinate(qcar, gps, ekf, DROPOFF_POS, speed_ctrl,car_actor)
-        drive_to_target_hybrid(
-            qcar, gps, ekf, 
+        drive_hybrid_with_vision(
+            qcar, gps, ekf, camera,
             node_sequence=[20,22,9], 
             final_coord=DROPOFF_POS, 
             speed_ctrl=speed_ctrl, 
@@ -285,8 +306,8 @@ def main():
         # # 7. Back to Hub & Magenta
         print("Step 7: Returning to Hub")
         # drive_to_coordinate(qcar, gps, ekf, TAXI_HUB_POS[:2], speed_ctrl, car_actor)
-        drive_to_target_hybrid(
-            qcar, gps, ekf, 
+        drive_hybrid_with_vision(
+            qcar, gps, ekf, camera,
             node_sequence=[9,7,14,20,22,10], 
             final_coord=TAXI_HUB_POS[:2], 
             speed_ctrl=speed_ctrl, 
