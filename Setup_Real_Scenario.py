@@ -107,7 +107,60 @@ def wait_keep_alive(qcar, gps, ekf, duration):
         time.sleep(dt)
 
  #
+def drive_to_target_hybrid(qcar, gps, ekf, node_sequence, final_coord, speed_ctrl, car_actor):
+    """
+    Drives through a sequence of roadmap nodes for lane centering, 
+    then finishes at a specific coordinate.
+    """
+    car_actor.set_led_strip_uniform(GREEN)
+    dt = 1.0 / CONTROLLER_RATE
+    roadmap = SDCSRoadMap(leftHandTraffic=False) #
+    
+    # 1. Generate the 'Lane Centered' part of the path from nodes
+    if node_sequence:
+        path_waypoints = roadmap.generate_path(node_sequence) #
+    else:
+        # If no nodes provided, start from current position
+        qcar.read()
+        path_waypoints = np.array([[ekf.x_hat[0,0]], [ekf.x_hat[1,0]]])
 
+    # 2. Append the 'Specific Coordinate' to the end of the roadmap waypoints
+    # This creates a smooth transition from the lane center to your specific spot
+    final_segment = np.linspace(path_waypoints[:, -1], final_coord, num=10).T 
+    full_waypoints = np.hstack((path_waypoints, final_segment)) #
+    
+    # 3. Initialize one controller for the entire combined path
+    steer_ctrl = SteeringController(waypoints=full_waypoints, k=0.15) #
+    
+    print(f"Navigating via nodes {node_sequence} to coordinate {final_coord}")
+    
+    while True:
+        qcar.read() #
+        
+        if gps.readGPS():
+            y_gps = np.array([gps.position[0], gps.position[1], gps.orientation[2]])
+            ekf.update([qcar.motorTach, 0], dt, y_gps, qcar.gyroscope[2])
+        else:
+            ekf.update([qcar.motorTach, 0], dt, None, qcar.gyroscope[2])
+        x, y, th = ekf.x_hat[0, 0], ekf.x_hat[1, 0], ekf.x_hat[2, 0]
+        v = qcar.motorTach
+        
+        # Look-ahead point for Stanley
+        p_front = np.array([x, y]) + np.array([np.cos(th), np.sin(th)]) * 0.3 #
+
+        # Calculate Control
+        thr = speed_ctrl.update(v, V_REF, dt)
+        str_ang = steer_ctrl.update(p_front, th, v)
+        qcar.write(thr, str_ang)
+
+        # Check if we reached the final specific coordinate
+        dist_to_final = np.linalg.norm(np.array(final_coord) - np.array([x, y]))
+        if dist_to_final < 0.2:
+            print("Arrived at specific coordinate.")
+            qcar.write(0, 0) #
+            break
+            
+        time.sleep(dt)
 def drive_hybrid_with_vision(qcar, gps, ekf, camera, node_sequence, final_coord, speed_ctrl, car_actor):
     """
     Blends Roadmap navigation with Real-time Lane Following.
@@ -271,9 +324,9 @@ def main():
         print("Step 3: Moving to Pickup (Green)")
         #car_actor.set_led_strip_uniform(GREEN)
         # Example: Use nodes 10 and 4 to stay in the lane, then go to the PICKUP_POS
-        drive_hybrid_with_vision(
-        qcar, gps, ekf, camera,
-        node_sequence=[2, 4, 14, 20], 
+        drive_to_target_hybrid(
+        qcar, gps, ekf,
+        node_sequence=[10,1, 13, 19,17, 20], 
         final_coord=PICKUP_POS, 
         speed_ctrl=speed_ctrl, 
         car_actor=car_actor
@@ -308,7 +361,7 @@ def main():
         # drive_to_coordinate(qcar, gps, ekf, TAXI_HUB_POS[:2], speed_ctrl, car_actor)
         drive_hybrid_with_vision(
             qcar, gps, ekf, camera,
-            node_sequence=[9,7,14,20,22,10], 
+            node_sequence=[9,7,5,3,1,8,10], 
             final_coord=TAXI_HUB_POS[:2], 
             speed_ctrl=speed_ctrl, 
             car_actor=car_actor,
